@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>OpenMath</title>
+    <script>
+      (() => {
+        const theme = localStorage.getItem("openmath:theme") || "dark";
+        document.documentElement.dataset.theme = theme;
+      })();
+    </script>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="shell">
+      <aside class="sidebar-shell">
+        <div id="project-rail" class="project-rail"></div>
+        <div id="workspace-sidebar" class="workspace-sidebar"></div>
+        <div class="sidebar-footer" id="inspector-panel">
+          <p class="muted">Context will appear here.</p>
+        </div>
+      </aside>
+
+      <main class="workspace-shell">
+        <header class="topbar">
+          <div class="document-title" id="topbar-title">
+            <p class="eyebrow">OpenMath</p>
+            <h1>Loading workspace</h1>
+            <p class="topbar-subtle">Reading projects, chats, and provider status.</p>
+          </div>
+          <div class="topbar-actions">
+            <div class="topbar-meta" id="topbar-meta">
+              <div class="pill">Loading workspace</div>
+            </div>
+            <button id="theme-toggle" class="theme-toggle" type="button" aria-label="Toggle theme">Light</button>
+          </div>
+        </header>
+
+        <div id="main-panel" class="main-panel">
+          <section class="hero panel shimmer">
+            <p class="panel-label">Boot status</p>
+            <h2>Loading projects and chats</h2>
+            <p class="muted">The gateway is reading workspace state from disk.</p>
+          </section>
+        </div>
+      </main>
+    </div>
+
+    <div id="dock-panel" class="dock-grid dock-hidden"></div>
+    <div id="dialog-root" class="dialog-root" hidden></div>
+
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>

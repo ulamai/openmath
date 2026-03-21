@@ -1,0 +1,53 @@
+.DS_Store
+
+# Editors and local tooling
+.vscode/
+.idea/
+
+# Python caches and build artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+
+# Node and package manager state
+node_modules/
+
+# Local virtual environments
+.venv/
+venv/
+
+# Local environment and secret material
+.env
+.env.*
+*.local
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Local provider and agent auth/config
+.codex/
+.claude/
+.gemini/
+.ulam/
+
+# Generated OpenMath workspace state and research outputs
+**/.openmath/
+logs/
+*.log
+*.pid
+
+# Local user projects kept inside this repo
+/frontier/
+/projects/
+
+# Local design references
+/openmath.jpg

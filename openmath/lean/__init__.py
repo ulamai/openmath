@@ -1,0 +1,1 @@
+"""Lean integration package scaffold."""
