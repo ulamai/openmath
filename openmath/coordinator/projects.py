@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from openmath.agents.engines import list_chat_engines
 from openmath.agents.providers import list_chat_providers
 from openmath.agents.runtime import list_agent_runs
 from openmath.api.schemas import serialize_project
@@ -18,12 +19,17 @@ def _count_files(root: Path) -> int:
     return sum(1 for path in root.rglob("*") if path.is_file())
 
 
-def collect_project_state(project: ProjectRecord) -> dict[str, object]:
+def collect_project_state(
+    project: ProjectRecord,
+    *,
+    settings: dict[str, object] | None = None,
+) -> dict[str, object]:
     graph = load_graph(project)
     runs = list_runs(project)
     active_agents = list_agent_runs(project, statuses={"queued", "running"}, limit=12)
     agent_stream = list_agent_runs(project, limit=18)
-    agent_providers = list_chat_providers()
+    agent_providers = list_chat_providers(settings)
+    agent_engines = list_chat_engines(project.root, settings=settings)
     sessions = list_sessions(project)
     backends = detect_backends(project.root)
     approvals_pending = _count_files(project.workspace / "approvals")
@@ -70,6 +76,7 @@ def collect_project_state(project: ProjectRecord) -> dict[str, object]:
         },
         "graph": graph,
         "agent_providers": agent_providers,
+        "agent_engines": agent_engines,
         "active_agents": active_agents,
         "agent_stream": agent_stream,
         "sessions": sessions,

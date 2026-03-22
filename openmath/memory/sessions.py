@@ -32,6 +32,16 @@ def _summary_path(project: ProjectRecord, session_id: str) -> Path:
     return _summaries_dir(project) / f"{session_id}.json"
 
 
+def provider_thread_storage_key(provider_id: str, engine_id: str = "none") -> str:
+    normalized_engine_id = (engine_id or "none").strip() or "none"
+    normalized_provider_id = provider_id.strip()
+    return (
+        normalized_provider_id
+        if normalized_engine_id == "none"
+        else f"{normalized_engine_id}:{normalized_provider_id}"
+    )
+
+
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
     with _SESSION_IO_LOCK:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -285,12 +295,16 @@ def get_provider_thread(
     project: ProjectRecord,
     session_id: str,
     provider_id: str,
+    engine_id: str = "none",
 ) -> dict[str, Any] | None:
     session = get_session(project, session_id)
     if session is None:
         return None
     provider_threads = session.get("provider_threads") or {}
-    thread = provider_threads.get(provider_id)
+    storage_key = provider_thread_storage_key(provider_id, engine_id)
+    thread = provider_threads.get(storage_key)
+    if not isinstance(thread, dict) and engine_id == "none":
+        thread = provider_threads.get(provider_id)
     if not isinstance(thread, dict):
         return None
     return thread
@@ -300,6 +314,7 @@ def upsert_provider_thread(
     project: ProjectRecord,
     session_id: str,
     provider_id: str,
+    engine_id: str = "none",
     **changes: Any,
 ) -> dict[str, Any]:
     session = get_session(project, session_id)
@@ -307,17 +322,22 @@ def upsert_provider_thread(
         raise FileNotFoundError(f"Unknown session: {session_id}")
 
     provider_threads = session.setdefault("provider_threads", {})
-    existing = provider_threads.get(provider_id)
+    storage_key = provider_thread_storage_key(provider_id, engine_id)
+    existing = provider_threads.get(storage_key)
+    if not isinstance(existing, dict) and engine_id == "none":
+        existing = provider_threads.get(provider_id)
     if not isinstance(existing, dict):
         existing = {
             "provider_id": provider_id,
+            "engine_id": engine_id or "none",
             "created_at": _now_iso(),
         }
 
     existing.update(changes)
     existing["provider_id"] = provider_id
+    existing["engine_id"] = engine_id or str(existing.get("engine_id") or "none")
     existing["updated_at"] = _now_iso()
-    provider_threads[provider_id] = existing
+    provider_threads[storage_key] = existing
 
     session["updated_at"] = _now_iso()
     _write_session(project, session)

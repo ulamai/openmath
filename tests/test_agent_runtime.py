@@ -206,6 +206,81 @@ class AgentRuntimeTests(unittest.TestCase):
             self.assertIn("native_resume", {run["continuation_mode"] for run in runs})
             self.assertTrue(all(run["backend"] == "codex_cli" for run in runs))
 
+    def test_launch_agent_run_scopes_native_threads_by_engine(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp) / "demo-project"
+            initialize_project(root, name="Demo Project", objective="Investigate a lemma.")
+            project = load_project(root)
+            session_id = list_sessions(project)[0]["id"]
+            provider = {
+                "id": "codex_cli",
+                "label": "Codex",
+                "status": "ready",
+                "connect_hint": "Run auth.",
+                "native_continuation": True,
+                "session_strategy": "capture_thread_id",
+            }
+            engine_none = {"id": "none", "label": "None", "available": True, "notes": []}
+            engine_ulam = {"id": "ulam", "label": "UlamAI", "available": True, "notes": []}
+
+            def resolve_engine(_root: Path, engine_id: str, settings=None):
+                return {"none": engine_none, "ulam": engine_ulam}[engine_id]
+
+            with (
+                patch("openmath.agents.runtime.get_chat_engine", side_effect=resolve_engine),
+                patch("openmath.agents.runtime.list_chat_providers", return_value=[provider]),
+                patch("openmath.agents.runtime.validate_model", return_value=True),
+                patch("openmath.agents.runtime.validate_effort", return_value=True),
+                patch("openmath.agents.runtime.threading.Thread", _ImmediateThread),
+                patch(
+                    "openmath.agents.runtime._run_process",
+                    side_effect=[
+                        (True, "Ulam first answer.", "", "", 0, "thread-ulam"),
+                        (True, "Direct answer.", "", "", 0, "thread-direct"),
+                        (True, "Ulam resumed answer.", "", "", 0, "thread-ulam"),
+                    ],
+                ),
+            ):
+                launch_agent_run(
+                    project,
+                    session_id=session_id,
+                    engine_id="ulam",
+                    provider_id="codex_cli",
+                    model="gpt-5-codex",
+                    effort="medium",
+                    prompt="Formalize this statement.",
+                )
+                launch_agent_run(
+                    project,
+                    session_id=session_id,
+                    engine_id="none",
+                    provider_id="codex_cli",
+                    model="gpt-5-codex",
+                    effort="medium",
+                    prompt="Answer directly.",
+                )
+                launch_agent_run(
+                    project,
+                    session_id=session_id,
+                    engine_id="ulam",
+                    provider_id="codex_cli",
+                    model="gpt-5-codex",
+                    effort="medium",
+                    prompt="Continue formalizing.",
+                )
+
+            session = get_session(project, session_id)
+            self.assertIsNotNone(session)
+            assert session is not None
+            self.assertEqual(session["provider_threads"]["ulam:codex_cli"]["native_session_id"], "thread-ulam")
+            self.assertEqual(session["provider_threads"]["codex_cli"]["native_session_id"], "thread-direct")
+
+            runs = list_agent_runs(project)
+            ulam_runs = [run for run in runs if run.get("engine") == "ulam"]
+            direct_runs = [run for run in runs if run.get("engine") == "none"]
+            self.assertEqual({run["continuation_mode"] for run in ulam_runs}, {"native_init", "native_resume"})
+            self.assertEqual(direct_runs[0]["continuation_mode"], "native_init")
+
     def test_autoresearch_run_ignores_done_marker_and_runs_to_loop_cap(self) -> None:
         with TemporaryDirectory() as tmp:
             root = Path(tmp) / "demo-project"
@@ -268,6 +343,33 @@ class AgentRuntimeTests(unittest.TestCase):
             self.assertEqual(runs[0]["iteration_count"], 3)
             self.assertEqual(runs[0]["max_iterations"], 3)
             self.assertEqual(runs[0]["max_minutes"], 120)
+
+    def test_launch_agent_run_rejects_unavailable_engine(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp) / "demo-project"
+            initialize_project(root, name="Demo Project", objective="Investigate a lemma.")
+            project = load_project(root)
+            session_id = list_sessions(project)[0]["id"]
+
+            with patch(
+                "openmath.agents.runtime.get_chat_engine",
+                side_effect=lambda _root, _engine_id, settings=None: {
+                    "id": "aristotle",
+                    "label": "Aristotle",
+                    "available": False,
+                    "notes": ["`aristotle` is not installed."],
+                },
+            ):
+                with self.assertRaisesRegex(ValueError, "aristotle"):
+                    launch_agent_run(
+                        project,
+                        session_id=session_id,
+                        engine_id="aristotle",
+                        provider_id="codex_cli",
+                        model="gpt-5-codex",
+                        effort="medium",
+                        prompt="Try a proof search.",
+                    )
 
     def test_request_agent_stop_marks_run_manifest(self) -> None:
         with TemporaryDirectory() as tmp:

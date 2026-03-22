@@ -7,6 +7,8 @@ from pathlib import Path
 import shutil
 import subprocess
 from typing import Any
+from urllib import error as urllib_error
+from urllib import request as urllib_request
 
 
 PROVIDER_CATALOG: dict[str, dict[str, Any]] = {
@@ -73,6 +75,23 @@ PROVIDER_CATALOG: dict[str, dict[str, Any]] = {
         "capabilities": ["chat", "project tools", "code agent"],
         "status_probe": "gemini_auth_heuristic",
     },
+    "ollama": {
+        "id": "ollama",
+        "label": "Ollama",
+        "command": "ollama",
+        "transport": "http",
+        "connect_command": [],
+        "connect_hint": "Set the Ollama base URL in Settings and make sure the Ollama server is running.",
+        "models": [],
+        "efforts": ["low", "medium", "high"],
+        "default_model": "",
+        "default_effort": "medium",
+        "native_effort": False,
+        "native_continuation": False,
+        "session_strategy": "transcript_replay",
+        "capabilities": ["chat", "local models", "code agent"],
+        "status_probe": "ollama_http",
+    },
 }
 
 
@@ -137,11 +156,47 @@ def _load_codex_models_from_cache() -> dict[str, Any] | None:
     }
 
 
-def _provider_catalog() -> dict[str, dict[str, Any]]:
+def _ollama_base_url(settings: dict[str, Any] | None) -> str:
+    configured = (
+        (settings or {}).get("providers", {}).get("ollama", {}).get("base_url")
+        or os.environ.get("OLLAMA_HOST")
+        or "http://127.0.0.1:11434"
+    )
+    return str(configured).rstrip("/")
+
+
+def _load_ollama_models(settings: dict[str, Any] | None) -> list[dict[str, str]]:
+    base_url = _ollama_base_url(settings)
+    try:
+        with urllib_request.urlopen(f"{base_url}/api/tags", timeout=2) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except (OSError, urllib_error.URLError, json.JSONDecodeError):
+        return []
+
+    models: list[dict[str, str]] = []
+    for item in payload.get("models", []):
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        if not name:
+            continue
+        models.append({"id": name, "label": name})
+    return models
+
+
+def _provider_catalog(settings: dict[str, Any] | None = None) -> dict[str, dict[str, Any]]:
     catalog = copy.deepcopy(PROVIDER_CATALOG)
     codex_overrides = _load_codex_models_from_cache()
     if codex_overrides:
         catalog["codex_cli"].update(codex_overrides)
+    ollama_models = _load_ollama_models(settings)
+    if ollama_models:
+        catalog["ollama"].update(
+            {
+                "models": ollama_models,
+                "default_model": ollama_models[0]["id"],
+            }
+        )
     return catalog
 
 
@@ -191,10 +246,10 @@ def _detect_gemini_auth() -> tuple[bool, str | None]:
     return False, None
 
 
-def _probe_status(provider_id: str) -> tuple[str, bool, str | None]:
-    catalog_entry = _provider_catalog()[provider_id]
+def _probe_status(provider_id: str, settings: dict[str, Any] | None = None) -> tuple[str, bool, str | None]:
+    catalog_entry = _provider_catalog(settings)[provider_id]
     executable = _command_exists(str(catalog_entry["command"]))
-    if not executable:
+    if provider_id != "ollama" and not executable:
         return "unavailable", False, None
 
     probe = str(catalog_entry["status_probe"])
@@ -204,24 +259,35 @@ def _probe_status(provider_id: str) -> tuple[str, bool, str | None]:
         connected, detail = _detect_claude_auth()
     elif probe == "gemini_auth_heuristic":
         connected, detail = _detect_gemini_auth()
+    elif probe == "ollama_http":
+        models = _load_ollama_models(settings)
+        if models:
+            connected, detail = True, f"{_ollama_base_url(settings)} ({len(models)} models)"
+        else:
+            connected, detail = False, _ollama_base_url(settings)
     else:
         connected, detail = False, None
+
+    if provider_id == "ollama":
+        return ("ready" if connected else "disconnected"), connected, detail
 
     return ("ready" if connected else "disconnected"), connected, executable if detail is None else f"{executable} ({detail})"
 
 
-def get_provider(provider_id: str) -> dict[str, Any] | None:
-    provider = _provider_catalog().get(provider_id)
+def get_provider(provider_id: str, settings: dict[str, Any] | None = None) -> dict[str, Any] | None:
+    provider = _provider_catalog(settings).get(provider_id)
     if provider is None:
         return None
+    if provider_id == "ollama":
+        provider["base_url"] = _ollama_base_url(settings)
     return dict(provider)
 
 
-def list_chat_providers() -> list[dict[str, Any]]:
-    catalog = _provider_catalog()
+def list_chat_providers(settings: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    catalog = _provider_catalog(settings)
     providers: list[dict[str, Any]] = []
     for provider_id, catalog_entry in catalog.items():
-        status, connected, executable = _probe_status(provider_id)
+        status, connected, executable = _probe_status(provider_id, settings)
         providers.append(
             {
                 **catalog_entry,
@@ -229,20 +295,21 @@ def list_chat_providers() -> list[dict[str, Any]]:
                 "connected": connected,
                 "available": status != "unavailable",
                 "executable": executable,
+                **({"base_url": _ollama_base_url(settings)} if provider_id == "ollama" else {}),
             }
         )
     return providers
 
 
-def validate_model(provider_id: str, model: str) -> bool:
-    provider = _provider_catalog().get(provider_id)
+def validate_model(provider_id: str, model: str, settings: dict[str, Any] | None = None) -> bool:
+    provider = _provider_catalog(settings).get(provider_id)
     if provider is None:
         return False
     return any(item["id"] == model for item in provider["models"])
 
 
-def validate_effort(provider_id: str, effort: str) -> bool:
-    provider = _provider_catalog().get(provider_id)
+def validate_effort(provider_id: str, effort: str, settings: dict[str, Any] | None = None) -> bool:
+    provider = _provider_catalog(settings).get(provider_id)
     if provider is None:
         return False
     return effort in provider["efforts"]

@@ -1,7 +1,7 @@
 {
   "name": "openmath",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Bootstrap scripts for the OpenMath monorepo.",
   "scripts": {
     "doctor": "python3 -m openmath doctor",

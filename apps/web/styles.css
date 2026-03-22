@@ -308,10 +308,12 @@ h3 {
   display: grid;
   gap: 14px;
   min-height: 0;
+  align-content: start;
 }
 
 .project-rail {
-  overflow: hidden;
+  overflow: auto;
+  padding-right: 4px;
 }
 
 .project-section,
@@ -399,6 +401,15 @@ h3 {
   min-height: 0;
   overflow: auto;
   padding-right: 4px;
+}
+
+body:not([data-route="chats"]) .workspace-sidebar {
+  overflow: auto;
+  padding-right: 4px;
+}
+
+body:not([data-route="chats"]) .workspace-sidebar .thread-list.compact {
+  max-height: min(28vh, 280px);
 }
 
 .project-card,
@@ -805,11 +816,11 @@ h3 {
 }
 
 .launcher-grid.compact {
-  grid-template-columns: repeat(3, minmax(0, 180px));
+  grid-template-columns: repeat(4, minmax(0, 180px));
 }
 
 .composer-launcher-grid {
-  grid-template-columns: repeat(3, minmax(0, 156px));
+  grid-template-columns: repeat(4, minmax(0, 148px));
 }
 
 .composer-automation {
@@ -852,6 +863,14 @@ h3 {
 .select-control {
   display: grid;
   gap: 6px;
+}
+
+.select-control-label {
+  padding-left: 10px;
+  color: var(--muted);
+  font-size: 0.68rem;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
 }
 
 .select-control-compact {
@@ -1113,6 +1132,66 @@ th {
   line-height: 1.6;
 }
 
+.settings-surface {
+  width: min(860px, 100%);
+  max-height: min(88vh, 920px);
+  overflow: auto;
+}
+
+.settings-head {
+  display: flex;
+  align-items: start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.settings-form,
+.settings-section,
+.settings-grid,
+.settings-card,
+.settings-field {
+  display: grid;
+  gap: 12px;
+}
+
+.settings-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.settings-card {
+  padding: 14px;
+  border-radius: 16px;
+  border: 1px solid var(--line);
+  background: color-mix(in srgb, var(--bg-soft) 62%, transparent);
+}
+
+.settings-card-head {
+  display: flex;
+  align-items: start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.settings-field input {
+  width: 100%;
+  padding: 12px 14px;
+  border: 1px solid var(--line-strong);
+  border-radius: 12px;
+  background: var(--bg-soft);
+  color: var(--text);
+}
+
+.settings-field input:focus {
+  outline: none;
+  border-color: color-mix(in srgb, var(--accent) 60%, var(--line-strong));
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+.settings-notice {
+  color: var(--success);
+  font-size: 0.9rem;
+}
+
 .dialog-form {
   display: grid;
 }
@@ -1301,5 +1380,9 @@ body[data-route="chats"] .topbar-meta:empty {
 
   .agent-stream-panel {
     max-height: none;
+  }
+
+  .settings-grid {
+    grid-template-columns: 1fr;
   }
 }

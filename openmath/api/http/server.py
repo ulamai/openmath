@@ -24,6 +24,7 @@ from openmath.memory.sessions import (
     list_sessions,
     rename_session,
 )
+from openmath.settings import load_settings, save_settings, serialize_settings_for_ui
 from openmath.workspace.project import (
     delete_project,
     discover_projects,
@@ -151,6 +152,7 @@ class OpenMathRequestHandler(BaseHTTPRequestHandler):
                 launched = launch_agent_run(
                     project,
                     session_id=str(payload.get("session_id") or ""),
+                    engine_id=str(payload.get("engine_id") or "none"),
                     provider_id=str(payload.get("provider_id") or ""),
                     model=str(payload.get("model") or ""),
                     effort=str(payload.get("effort") or "medium"),
@@ -158,6 +160,7 @@ class OpenMathRequestHandler(BaseHTTPRequestHandler):
                     run_mode=str(payload.get("run_mode") or "once"),
                     max_iterations=payload.get("max_iterations"),
                     max_minutes=payload.get("max_minutes"),
+                    settings=self._settings(),
                 )
             except (FileNotFoundError, ValueError) as error:
                 self._json({"error": str(error)}, status=HTTPStatus.BAD_REQUEST)
@@ -188,6 +191,22 @@ class OpenMathRequestHandler(BaseHTTPRequestHandler):
     def do_PATCH(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
         path = parsed.path or "/"
+        if path == "/api/settings":
+            payload = self._read_json()
+            updates = {
+                "providers": {
+                    "ollama": {
+                        "base_url": str(payload.get("ollama_base_url") or "").strip() or "http://127.0.0.1:11434",
+                    },
+                },
+            }
+            if "aristotle_api_key" in payload:
+                updates.setdefault("engines", {}).setdefault("aristotle", {})["api_key"] = str(payload.get("aristotle_api_key") or "").strip()
+            if payload.get("clear_aristotle_api_key") is True:
+                updates.setdefault("engines", {}).setdefault("aristotle", {})["api_key"] = ""
+            settings = save_settings(self.search_root, updates)
+            self._json({"settings": serialize_settings_for_ui(settings)})
+            return
         path_parts = [part for part in path.split("/") if part]
         if len(path_parts) == 3 and path_parts[:2] == ["api", "projects"]:
             project = self._project_or_404(path_parts[2])
@@ -268,6 +287,10 @@ class OpenMathRequestHandler(BaseHTTPRequestHandler):
             self._json(serialize_project_list(projects))
             return
 
+        if path == "/api/settings":
+            self._json({"settings": serialize_settings_for_ui(self._settings())})
+            return
+
         if path == "/api/doctor":
             self._json(build_doctor_report(self.search_root))
             return
@@ -283,7 +306,7 @@ class OpenMathRequestHandler(BaseHTTPRequestHandler):
 
         route = path_parts[3]
         if route == "state":
-            self._json(collect_project_state(project))
+            self._json(collect_project_state(project, settings=self._settings()))
             return
         if route == "runs":
             self._json({"runs": list_runs(project)})
@@ -296,7 +319,7 @@ class OpenMathRequestHandler(BaseHTTPRequestHandler):
             return
         if route == "agents":
             if len(path_parts) == 5 and path_parts[4] == "providers":
-                self._json({"providers": list_chat_providers()})
+                self._json({"providers": list_chat_providers(self._settings())})
                 return
             if len(path_parts) == 5 and path_parts[4] == "runs":
                 self._json({"runs": list_agent_runs(project)})
@@ -328,7 +351,7 @@ class OpenMathRequestHandler(BaseHTTPRequestHandler):
             name=name,
             objective=str(payload.get("objective") or f"Define the first research objective for {name}."),
         )
-        self._json(collect_project_state(project), status=HTTPStatus.CREATED)
+        self._json(collect_project_state(project, settings=self._settings()), status=HTTPStatus.CREATED)
 
     def _project_or_404(self, project_id: str):
         project = resolve_project(_project_search_root(self.search_root), project_id)
@@ -347,6 +370,9 @@ class OpenMathRequestHandler(BaseHTTPRequestHandler):
         if not raw:
             return {}
         return json.loads(raw)
+
+    def _settings(self) -> dict[str, object]:
+        return load_settings(self.search_root)
 
     def _serve_web_asset(self, raw_path: str) -> None:
         path = "/" if raw_path == "" else raw_path

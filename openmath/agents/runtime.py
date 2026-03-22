@@ -7,17 +7,21 @@ from pathlib import Path
 import subprocess
 import threading
 from typing import Any
+from urllib import error as urllib_error
+from urllib import request as urllib_request
 from uuid import uuid4
 
 from openmath.memory.sessions import (
     add_message,
     get_provider_thread,
     get_session,
+    provider_thread_storage_key,
     update_message,
     upsert_provider_thread,
 )
 from openmath.workspace.project import ProjectRecord, slugify
 
+from .engines import get_chat_engine
 from .providers import list_chat_providers, validate_effort, validate_model
 
 _RUN_LOCK = threading.RLock()
@@ -160,19 +164,52 @@ def _recent_transcript(
     return "\n\n".join(selected)
 
 
+def _engine_profile(engine: dict[str, Any]) -> str:
+    engine_id = str(engine.get("id") or "none")
+    if engine_id == "ulam":
+        return (
+            "Work like a math formalization engine. Decompose the problem into precise claims, "
+            "surface missing hypotheses, suggest Lean-relevant lemma searches, and keep explicit "
+            "proof obligations and verification steps in view."
+        )
+    if engine_id == "aristotle":
+        return (
+            "Work like an autonomous proof engine. Organize the task into proof jobs, likely tactics, "
+            "artifact checkpoints, and exact next actions that can be verified or delegated."
+        )
+    if engine_id == "lean4_skills":
+        return (
+            "Stay close to Lean 4. Prefer small checkable steps, realistic tactic scripts, exact theorem "
+            "shapes, and concrete lake or lean commands when they help."
+        )
+    return ""
+
+
+def _agent_identity_label(provider: dict[str, Any], engine: dict[str, Any]) -> str:
+    provider_label = str(provider["label"])
+    if str(engine.get("id") or "none") == "none":
+        return provider_label
+    return f"{engine['label']} + {provider_label}"
+
+
 def _build_agent_prompt(
     project: ProjectRecord,
     session: dict[str, Any],
     *,
     prompt: str,
+    engine: dict[str, Any],
     provider_label: str,
     effort: str,
     exclude_message_ids: set[str] | None = None,
 ) -> str:
     transcript = _recent_transcript(session, exclude_message_ids=exclude_message_ids)
     thread_title = str(session.get("title") or "Untitled chat")
+    engine_label = str(engine.get("label") or "None")
+    engine_profile = _engine_profile(engine)
+    engine_block = f"Engine instructions: {engine_profile}\n" if engine_profile else ""
     return (
         f"You are {provider_label} running inside OpenMath.\n"
+        f"Engine: {engine_label}\n"
         f"Project: {project.name}\n"
         f"Project root: {project.root}\n"
         f"Objective: {project.objective}\n"
@@ -180,6 +217,7 @@ def _build_agent_prompt(
         f"Requested reasoning effort: {effort}\n"
         "Mode: answer in a normal chat style, but use project context and files when useful. "
         "Do not edit files unless the user explicitly asks for code changes.\n\n"
+        f"{engine_block}"
         "Recent conversation:\n"
         f"{transcript or 'No prior messages.'}\n\n"
         "Current user request:\n"
@@ -192,6 +230,7 @@ def _build_loop_iteration_prompt(
     session: dict[str, Any],
     *,
     prompt: str,
+    engine: dict[str, Any],
     provider_label: str,
     effort: str,
     run_mode: str,
@@ -209,6 +248,7 @@ def _build_loop_iteration_prompt(
             project,
             session,
             prompt=prompt,
+            engine=engine,
             provider_label=provider_label,
             effort=effort,
             exclude_message_ids=exclude_message_ids,
@@ -234,6 +274,7 @@ def _build_loop_iteration_prompt(
         project,
         session,
         prompt=loop_brief,
+        engine=engine,
         provider_label=provider_label,
         effort=effort,
         exclude_message_ids=exclude_message_ids,
@@ -340,6 +381,46 @@ def _parse_gemini(stdout_text: str, stderr_text: str) -> tuple[bool, str]:
     return False, "Gemini CLI returned no output."
 
 
+def _run_ollama(
+    provider: dict[str, Any],
+    *,
+    prompt: str,
+    model: str,
+) -> tuple[bool, str, str, str, int, str | None]:
+    base_url = str(provider.get("base_url") or "http://127.0.0.1:11434").rstrip("/")
+    request = urllib_request.Request(
+        f"{base_url}/api/generate",
+        data=json.dumps(
+            {
+                "model": model,
+                "prompt": prompt,
+                "stream": False,
+            }
+        ).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib_request.urlopen(request, timeout=120) as response:
+            stdout_text = response.read().decode("utf-8")
+    except urllib_error.HTTPError as error:
+        stderr_text = error.read().decode("utf-8", errors="replace")
+        return False, stderr_text.strip() or str(error), "", stderr_text, error.code, None
+    except (OSError, urllib_error.URLError) as error:
+        stderr_text = str(error)
+        return False, stderr_text, "", stderr_text, 1, None
+
+    try:
+        payload = json.loads(stdout_text)
+    except json.JSONDecodeError:
+        return False, stdout_text.strip() or "Ollama returned invalid JSON.", stdout_text, "", 1, None
+
+    result = str(payload.get("response") or "").strip()
+    if result:
+        return True, result, stdout_text, "", 0, None
+    return False, "Ollama returned no output.", stdout_text, "", 0, None
+
+
 def _build_command(
     provider: dict[str, Any],
     *,
@@ -421,6 +502,14 @@ def _build_command(
             model,
         ]
 
+    if provider_id == "ollama":
+        return [
+            "ollama",
+            "run",
+            model,
+            prompt,
+        ]
+
     raise ValueError(f"Unsupported provider: {provider_id}")
 
 
@@ -435,6 +524,9 @@ def _run_process(
     continuation_mode: str,
     provider_session_id: str | None,
 ) -> tuple[bool, str, str, str, int, str | None]:
+    if provider["id"] == "ollama":
+        return _run_ollama(provider, prompt=prompt, model=model)
+
     command = _build_command(
         provider,
         project=project,
@@ -481,10 +573,12 @@ def _run_process(
 def _resolve_execution_plan(
     session: dict[str, Any],
     provider: dict[str, Any],
+    *,
+    engine_id: str,
 ) -> dict[str, Any]:
     provider_id = str(provider["id"])
     provider_threads = session.get("provider_threads") or {}
-    existing_thread = provider_threads.get(provider_id)
+    existing_thread = provider_threads.get(provider_thread_storage_key(provider_id, engine_id))
     if not isinstance(existing_thread, dict):
         existing_thread = None
 
@@ -541,6 +635,7 @@ def _stage_provider_thread(
     project: ProjectRecord,
     *,
     session_id: str,
+    engine: dict[str, Any],
     provider: dict[str, Any],
     run_id: str,
     model: str,
@@ -551,6 +646,8 @@ def _stage_provider_thread(
         project,
         session_id,
         str(provider["id"]),
+        engine_id=str(engine.get("id") or "none"),
+        engine_label=str(engine.get("label") or "None"),
         provider_label=str(provider["label"]),
         native_session_id=provider_session_id,
         active_run_id=run_id,
@@ -567,6 +664,7 @@ def _finalize_provider_thread(
     project: ProjectRecord,
     *,
     session_id: str,
+    engine: dict[str, Any],
     provider: dict[str, Any],
     run_id: str,
     model: str,
@@ -574,7 +672,12 @@ def _finalize_provider_thread(
     provider_session_id: str | None,
     final_status: str,
 ) -> None:
-    existing = get_provider_thread(project, session_id, str(provider["id"]))
+    existing = get_provider_thread(
+        project,
+        session_id,
+        str(provider["id"]),
+        engine_id=str(engine.get("id") or "none"),
+    )
     if existing is None or existing.get("active_run_id") != run_id:
         return
 
@@ -582,6 +685,8 @@ def _finalize_provider_thread(
         project,
         session_id,
         str(provider["id"]),
+        engine_id=str(engine.get("id") or "none"),
+        engine_label=str(engine.get("label") or "None"),
         provider_label=str(provider["label"]),
         native_session_id=provider_session_id or existing.get("native_session_id"),
         active_run_id=None,
@@ -599,6 +704,7 @@ def _execute_agent_run(
     project: ProjectRecord,
     *,
     session_id: str,
+    engine: dict[str, Any],
     provider: dict[str, Any],
     model: str,
     effort: str,
@@ -630,11 +736,12 @@ def _execute_agent_run(
     latest_assistant_message_id = assistant_message_id
 
     try:
+        agent_label = _agent_identity_label(provider, engine)
         _update_manifest(
             manifest_path,
             status="running",
             started_at=_now_iso(),
-            summary=f"Running {provider['label']} with {model}.",
+            summary=f"Running {agent_label} with {model}.",
             iteration_count=0,
             current_iteration=1,
             last_activity_at=_now_iso(),
@@ -644,6 +751,8 @@ def _execute_agent_run(
             {
                 "timestamp": _now_iso(),
                 "event": "agent.run.started",
+                "engine": engine["id"],
+                "engine_label": engine["label"],
                 "provider": provider["id"],
                 "model": model,
                 "effort": effort,
@@ -658,16 +767,14 @@ def _execute_agent_run(
         for iteration in range(1, max_iterations + 1):
             if _stop_requested(run_id):
                 final_status = "stopped"
-                final_summary = f"Stopped {provider['label']} after {iteration_count} loops."
+                final_summary = f"Stopped {agent_label} after {iteration_count} loops."
                 if not result_text:
                     result_text = "Run stopped before the next loop started."
                 break
 
             if iteration > 1 and datetime.now(UTC) >= started_at + timedelta(minutes=max_minutes):
                 final_status = "finished"
-                final_summary = (
-                    f"Completed {provider['label']} autoresearch budget after {iteration_count} loops."
-                )
+                final_summary = f"Completed {agent_label} autoresearch budget after {iteration_count} loops."
                 break
 
             session = get_session(project, session_id)
@@ -685,13 +792,15 @@ def _execute_agent_run(
                     role="assistant",
                     content="",
                     source="agent-runner",
+                    engine=str(engine["id"]),
+                    engine_label=str(engine["label"]),
                     provider=provider["id"],
                     provider_label=str(provider["label"]),
                     model=model,
                     effort=effort,
                     status="running",
                     run_id=run_id,
-                    title=f"{provider['label']} loop {iteration}",
+                    title=f"{agent_label} loop {iteration}",
                     continuation_mode=iteration_mode,
                     loop_iteration=iteration,
                     run_mode=run_mode,
@@ -704,7 +813,7 @@ def _execute_agent_run(
                 current_iteration=iteration,
                 last_activity_at=_now_iso(),
                 summary=(
-                    f"Running {provider['label']} {_loop_summary(run_mode, iteration_count=iteration, max_iterations=max_iterations).lower()}."
+                    f"Running {agent_label} {_loop_summary(run_mode, iteration_count=iteration, max_iterations=max_iterations).lower()}."
                 ),
             )
             _append_event(
@@ -712,6 +821,8 @@ def _execute_agent_run(
                 {
                     "timestamp": _now_iso(),
                     "event": "agent.run.iteration.started",
+                    "engine": engine["id"],
+                    "engine_label": engine["label"],
                     "provider": provider["id"],
                     "model": model,
                     "effort": effort,
@@ -728,7 +839,8 @@ def _execute_agent_run(
                 project,
                 session,
                 prompt=prompt,
-                provider_label=str(provider["label"]),
+                engine=engine,
+                provider_label=agent_label,
                 effort=effort,
                 run_mode=run_mode,
                 iteration=iteration,
@@ -758,14 +870,14 @@ def _execute_agent_run(
                 )
             except FileNotFoundError:
                 success = False
-                iteration_result = f"{provider['label']} is not installed. {provider['connect_hint']}"
+                iteration_result = f"{agent_label} is not installed. {provider['connect_hint']}"
                 stdout_text = ""
                 stderr_text = iteration_result
                 return_code = 127
                 resolved_provider_session_id = iteration_provider_session_id
             except Exception as error:  # noqa: BLE001
                 success = False
-                iteration_result = f"{provider['label']} failed to start: {error}"
+                iteration_result = f"{agent_label} failed to start: {error}"
                 stdout_text = ""
                 stderr_text = iteration_result
                 return_code = 1
@@ -794,6 +906,7 @@ def _execute_agent_run(
                 _stage_provider_thread(
                     project,
                     session_id=session_id,
+                    engine=engine,
                     provider=provider,
                     run_id=run_id,
                     model=model,
@@ -806,6 +919,8 @@ def _execute_agent_run(
                 {
                     "timestamp": finished_at,
                     "event": f"agent.run.iteration.{'finished' if success else 'failed'}",
+                    "engine": engine["id"],
+                    "engine_label": engine["label"],
                     "provider": provider["id"],
                     "model": model,
                     "effort": effort,
@@ -824,25 +939,25 @@ def _execute_agent_run(
                 continuation_mode=iteration_mode,
                 provider_session_id=resolved_provider_session_id,
                 summary=(
-                    f"{provider['label']} completed {_loop_summary(run_mode, iteration_count=iteration_count, max_iterations=max_iterations).lower()}."
+                    f"{agent_label} completed {_loop_summary(run_mode, iteration_count=iteration_count, max_iterations=max_iterations).lower()}."
                     if success
-                    else f"{provider['label']} failed on loop {iteration_count}."
+                    else f"{agent_label} failed on loop {iteration_count}."
                 ),
             )
 
             if not success:
                 final_status = "failed"
-                final_summary = f"{provider['label']} failed on loop {iteration_count}."
+                final_summary = f"{agent_label} failed on loop {iteration_count}."
                 break
 
             if run_mode == "once":
                 final_status = "finished"
-                final_summary = f"{provider['label']} replied with {model}."
+                final_summary = f"{agent_label} replied with {model}."
                 break
 
             if iteration >= max_iterations:
                 final_status = "finished"
-                final_summary = f"{provider['label']} completed {iteration_count} autoresearch loops."
+                final_summary = f"{agent_label} completed {iteration_count} autoresearch loops."
                 break
 
             iteration_mode = (
@@ -854,11 +969,11 @@ def _execute_agent_run(
 
         if not final_summary:
             if final_status == "finished":
-                final_summary = f"{provider['label']} completed {iteration_count} loops."
+                final_summary = f"{agent_label} completed {iteration_count} loops."
             elif final_status == "stopped":
-                final_summary = f"Stopped {provider['label']} after {iteration_count} loops."
+                final_summary = f"Stopped {agent_label} after {iteration_count} loops."
             else:
-                final_summary = f"{provider['label']} failed."
+                final_summary = f"{agent_label} failed."
 
         finished_at = _now_iso()
         if iteration_count == 0:
@@ -888,6 +1003,8 @@ def _execute_agent_run(
             run_directory / "summary.json",
             {
                 "headline": final_summary,
+                "engine": engine["id"],
+                "engine_label": engine["label"],
                 "provider": provider["label"],
                 "model": model,
                 "effort": effort,
@@ -906,6 +1023,8 @@ def _execute_agent_run(
             {
                 "timestamp": finished_at,
                 "event": f"agent.run.{final_status}",
+                "engine": engine["id"],
+                "engine_label": engine["label"],
                 "provider": provider["id"],
                 "model": model,
                 "effort": effort,
@@ -920,6 +1039,7 @@ def _execute_agent_run(
             _finalize_provider_thread(
                 project,
                 session_id=session_id,
+                engine=engine,
                 provider=provider,
                 run_id=run_id,
                 model=model,
@@ -937,6 +1057,7 @@ def launch_agent_run(
     project: ProjectRecord,
     *,
     session_id: str,
+    engine_id: str = "none",
     provider_id: str,
     model: str,
     effort: str,
@@ -944,28 +1065,37 @@ def launch_agent_run(
     run_mode: str = "once",
     max_iterations: int | None = None,
     max_minutes: int | None = None,
+    settings: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     provider = next(
-        (candidate for candidate in list_chat_providers() if candidate["id"] == provider_id),
+        (candidate for candidate in list_chat_providers(settings) if candidate["id"] == provider_id),
         None,
     )
+    engine = get_chat_engine(project.root, engine_id, settings=settings)
+    if engine is None:
+        raise ValueError("Unknown engine.")
+    if not engine["available"]:
+        notes = [str(note) for note in engine.get("notes", [])]
+        raise ValueError(notes[0] if notes else f"{engine['label']} is unavailable.")
     if provider is None:
         raise ValueError("Unknown provider.")
     if provider["status"] != "ready":
         raise ValueError(provider["connect_hint"])
-    if not validate_model(provider_id, model):
+    if not validate_model(provider_id, model, settings):
         raise ValueError("Unsupported model for provider.")
-    if not validate_effort(provider_id, effort):
+    if not validate_effort(provider_id, effort, settings):
         raise ValueError("Unsupported effort for provider.")
     normalized_run_mode = _normalize_run_mode(run_mode)
     normalized_max_iterations = _normalize_max_iterations(normalized_run_mode, max_iterations)
     normalized_max_minutes = _normalize_max_minutes(normalized_run_mode, max_minutes)
+    normalized_engine_id = str(engine["id"])
+    agent_label = _agent_identity_label(provider, engine)
 
     with _RUN_LOCK:
         session = get_session(project, session_id)
         if session is None:
             raise FileNotFoundError(f"Unknown session: {session_id}")
-        execution_plan = _resolve_execution_plan(session, provider)
+        execution_plan = _resolve_execution_plan(session, provider, engine_id=normalized_engine_id)
 
         run_id = _build_run_id(provider_id)
         run_directory = _run_dir(project, run_id)
@@ -979,6 +1109,8 @@ def launch_agent_run(
             role="user",
             content=prompt,
             source="chat-ui",
+            engine=normalized_engine_id,
+            engine_label=str(engine["label"]),
             provider=provider_id,
             provider_label=str(provider["label"]),
             model=model,
@@ -994,13 +1126,15 @@ def launch_agent_run(
             role="assistant",
             content="",
             source="agent-runner",
+            engine=normalized_engine_id,
+            engine_label=str(engine["label"]),
             provider=provider_id,
             provider_label=str(provider["label"]),
             model=model,
             effort=effort,
             status="running",
             run_id=run_id,
-            title=f"{provider['label']} is running...",
+            title=f"{agent_label} is running...",
             run_mode=normalized_run_mode,
             loop_iteration=1,
             continuation_mode=execution_plan["continuation_mode"],
@@ -1010,6 +1144,7 @@ def launch_agent_run(
             _stage_provider_thread(
                 project,
                 session_id=session_id,
+                engine=engine,
                 provider=provider,
                 run_id=run_id,
                 model=model,
@@ -1021,6 +1156,8 @@ def launch_agent_run(
             "id": run_id,
             "type": "chat_agent",
             "backend": provider_id,
+            "engine": normalized_engine_id,
+            "engine_label": engine["label"],
             "provider_label": provider["label"],
             "session_id": session_id,
             "user_message_id": user_message["id"],
@@ -1032,9 +1169,9 @@ def launch_agent_run(
             "model": model,
             "effort": effort,
             "summary": (
-                f"Queued {provider['label']} for autoresearch."
+                f"Queued {agent_label} for autoresearch."
                 if normalized_run_mode == "autoresearch"
-                else f"Queued {provider['label']} with {model}."
+                else f"Queued {agent_label} with {model}."
             ),
             "prompt_excerpt": prompt[:400],
             "session_title": str(session.get("title") or "Untitled chat"),
@@ -1054,6 +1191,8 @@ def launch_agent_run(
             {
                 "timestamp": _now_iso(),
                 "event": "agent.run.queued",
+                "engine": normalized_engine_id,
+                "engine_label": engine["label"],
                 "provider": provider_id,
                 "model": model,
                 "effort": effort,
@@ -1072,6 +1211,7 @@ def launch_agent_run(
             kwargs={
                 "project": project,
                 "session_id": session_id,
+                "engine": engine,
                 "provider": provider,
                 "model": model,
                 "effort": effort,

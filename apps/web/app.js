@@ -11,11 +11,13 @@ const els = {
   topbarTitle: document.querySelector("#topbar-title"),
   topbarMeta: document.querySelector("#topbar-meta"),
   themeToggle: document.querySelector("#theme-toggle"),
+  settingsButton: document.querySelector("#settings-button"),
   projectRail: document.querySelector("#project-rail"),
   workspaceSidebar: document.querySelector("#workspace-sidebar"),
   mainPanel: document.querySelector("#main-panel"),
   inspectorPanel: document.querySelector("#inspector-panel"),
   dockPanel: document.querySelector("#dock-panel"),
+  settingsRoot: document.querySelector("#settings-root"),
   dialogRoot: document.querySelector("#dialog-root"),
 };
 
@@ -24,6 +26,12 @@ let threadRenameState = null;
 let projectRenameState = null;
 let projectCreateOpen = false;
 let dialogState = null;
+let workspaceSettings = null;
+let settingsOpen = false;
+let settingsBusy = false;
+let settingsError = "";
+let settingsNotice = "";
+let latestProjectState = null;
 
 const themeStorageKey = "openmath:theme";
 
@@ -48,6 +56,39 @@ function initializeThemeToggle() {
     const next = currentTheme() === "light" ? "dark" : "light";
     window.localStorage.setItem(themeStorageKey, next);
     applyTheme(next);
+  });
+}
+
+function defaultWorkspaceSettings() {
+  return {
+    providers: {
+      ollama: {
+        base_url: "http://127.0.0.1:11434",
+      },
+    },
+    engines: {
+      aristotle: {
+        has_api_key: false,
+        api_key_preview: "",
+      },
+    },
+  };
+}
+
+function currentWorkspaceSettings() {
+  return workspaceSettings ?? defaultWorkspaceSettings();
+}
+
+function initializeSettingsButton() {
+  if (!els.settingsButton || els.settingsButton.dataset.bound === "true") {
+    return;
+  }
+  els.settingsButton.dataset.bound = "true";
+  els.settingsButton.addEventListener("click", () => {
+    settingsOpen = true;
+    settingsError = "";
+    settingsNotice = "";
+    renderSettingsModal();
   });
 }
 
@@ -293,6 +334,244 @@ function openPromptDialog({
   });
 }
 
+function settingsProviderRecord(providerId) {
+  const liveProvider = latestProjectState?.agent_providers?.find((provider) => provider.id === providerId);
+  if (liveProvider) {
+    return liveProvider;
+  }
+  const fallbackCatalog = {
+    codex_cli: {
+      id: "codex_cli",
+      label: "Codex",
+      status: "unknown",
+      connect_command: ["ulam", "auth", "codex"],
+      connect_hint: "Run the Codex CLI auth flow from a terminal.",
+    },
+    claude_cli: {
+      id: "claude_cli",
+      label: "Claude Code",
+      status: "unknown",
+      connect_command: ["ulam", "auth", "claude"],
+      connect_hint: "Run the Claude Code auth flow from a terminal.",
+    },
+    gemini_cli: {
+      id: "gemini_cli",
+      label: "Gemini CLI",
+      status: "unknown",
+      connect_command: ["ulam", "auth", "gemini"],
+      connect_hint: "Run the Gemini CLI auth flow from a terminal.",
+    },
+    ollama: {
+      id: "ollama",
+      label: "Ollama",
+      status: "unknown",
+      models: [],
+      connect_command: [],
+      connect_hint: "Point OpenMath at the Ollama server URL and make sure it is running.",
+    },
+  };
+  return fallbackCatalog[providerId] ?? null;
+}
+
+function closeSettingsModal() {
+  settingsOpen = false;
+  settingsBusy = false;
+  settingsError = "";
+  settingsNotice = "";
+  renderSettingsModal();
+}
+
+function renderSettingsModal() {
+  if (!els.settingsRoot) {
+    return;
+  }
+
+  if (!settingsOpen) {
+    els.settingsRoot.hidden = true;
+    els.settingsRoot.innerHTML = "";
+    return;
+  }
+
+  const settings = currentWorkspaceSettings();
+  const ollamaBaseUrl = settings.providers?.ollama?.base_url ?? "http://127.0.0.1:11434";
+  const aristotleSettings = settings.engines?.aristotle ?? {};
+  const aristotlePreview = aristotleSettings.api_key_preview
+    ? `Saved: ${aristotleSettings.api_key_preview}`
+    : "No API key saved yet.";
+  const cliProviderCards = ["codex_cli", "claude_cli", "gemini_cli"]
+    .map((providerId) => {
+      const provider = settingsProviderRecord(providerId);
+      if (!provider) {
+        return "";
+      }
+      const command = (provider.connect_command ?? []).join(" ");
+      return `
+        <article class="settings-card">
+          <div class="settings-card-head">
+            <div>
+              <p class="panel-label">Provider</p>
+              <h3>${escapeHtml(provider.label)}</h3>
+            </div>
+            <span class="status-chip">${escapeHtml(provider.status ?? "unknown")}</span>
+          </div>
+          <p class="muted">${escapeHtml(provider.connect_hint ?? "Open a project to inspect this provider.")}</p>
+          ${command ? `<code>${escapeHtml(command)}</code>` : ""}
+          ${command ? `<button class="sidebar-action" type="button" data-copy-command="${escapeHtml(command)}">Copy command</button>` : ""}
+        </article>
+      `;
+    })
+    .join("");
+  const ollamaProvider = settingsProviderRecord("ollama");
+  const ollamaModelCount = formatCount(ollamaProvider?.models?.length ?? 0);
+  const noticeBlock = settingsNotice ? `<p class="settings-notice">${escapeHtml(settingsNotice)}</p>` : "";
+  const errorBlock = settingsError ? `<p class="form-error">${escapeHtml(settingsError)}</p>` : "";
+
+  els.settingsRoot.hidden = false;
+  els.settingsRoot.innerHTML = `
+    <div class="dialog-backdrop">
+      <div class="dialog-surface settings-surface" role="dialog" aria-modal="true" aria-labelledby="settings-title">
+        <div class="settings-head">
+          <div>
+            <p class="panel-label">OpenMath</p>
+            <h2 id="settings-title">Settings</h2>
+          </div>
+          <button id="settings-close" class="ghost-icon-button" type="button" aria-label="Close settings">×</button>
+        </div>
+        ${errorBlock}
+        ${noticeBlock}
+        <form id="settings-form" class="settings-form">
+          <section class="settings-section">
+            <div class="sidebar-section-head">
+              <p class="panel-label">CLI Providers</p>
+              <span class="thread-count">${latestProjectState ? "live status" : "status when a project is open"}</span>
+            </div>
+            <div class="settings-grid">
+              ${cliProviderCards}
+            </div>
+          </section>
+          <section class="settings-section">
+            <div class="sidebar-section-head">
+              <p class="panel-label">Ollama</p>
+              <span class="status-chip">${escapeHtml(ollamaProvider?.status ?? "unknown")}</span>
+            </div>
+            <p class="muted">Use a running Ollama server as a local chat provider.</p>
+            <label class="settings-field">
+              <span class="select-control-label">Base URL</span>
+              <input id="settings-ollama-base-url" type="text" value="${escapeHtml(ollamaBaseUrl)}" placeholder="http://127.0.0.1:11434" />
+            </label>
+            <p class="muted">Detected models: ${escapeHtml(ollamaModelCount)}</p>
+          </section>
+          <section class="settings-section">
+            <div class="sidebar-section-head">
+              <p class="panel-label">Aristotle</p>
+              <span class="status-chip">${escapeHtml(aristotleSettings.has_api_key ? "api key saved" : "no api key")}</span>
+            </div>
+            <p class="muted">Store the Aristotle API key locally for the workspace. It stays under ignored <code>.openmath/</code> data.</p>
+            <p class="muted">${escapeHtml(aristotlePreview)}</p>
+            <label class="settings-field">
+              <span class="select-control-label">API Key</span>
+              <input id="settings-aristotle-api-key" type="password" value="" placeholder="Leave blank to keep the current key" />
+            </label>
+            <div class="project-create-actions">
+              <button id="settings-clear-aristotle-key" class="sidebar-action" type="button">Clear key</button>
+            </div>
+          </section>
+          <div class="dialog-actions">
+            <button id="settings-cancel" class="dialog-button secondary" type="button">Close</button>
+            <button id="settings-save" class="dialog-button primary" type="submit" ${settingsBusy ? "disabled" : ""}>${settingsBusy ? "Saving..." : "Save settings"}</button>
+          </div>
+        </form>
+      </div>
+    </div>
+  `;
+
+  const backdrop = els.settingsRoot.querySelector(".dialog-backdrop");
+  const closeButton = document.querySelector("#settings-close");
+  const cancelButton = document.querySelector("#settings-cancel");
+  const clearKeyButton = document.querySelector("#settings-clear-aristotle-key");
+  const settingsForm = document.querySelector("#settings-form");
+  const ollamaInput = document.querySelector("#settings-ollama-base-url");
+  const aristotleInput = document.querySelector("#settings-aristotle-api-key");
+
+  backdrop?.addEventListener("click", (event) => {
+    if (event.target === backdrop && !settingsBusy) {
+      closeSettingsModal();
+    }
+  });
+  closeButton?.addEventListener("click", () => {
+    if (!settingsBusy) {
+      closeSettingsModal();
+    }
+  });
+  cancelButton?.addEventListener("click", () => {
+    if (!settingsBusy) {
+      closeSettingsModal();
+    }
+  });
+  document.querySelectorAll("[data-copy-command]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const command = button.getAttribute("data-copy-command");
+      if (!command) {
+        return;
+      }
+      try {
+        await navigator.clipboard.writeText(command);
+        settingsNotice = `${command} copied.`;
+      } catch (_error) {
+        settingsError = "Clipboard access failed.";
+      }
+      renderSettingsModal();
+    });
+  });
+  clearKeyButton?.addEventListener("click", async () => {
+    settingsBusy = true;
+    settingsError = "";
+    settingsNotice = "";
+    renderSettingsModal();
+    try {
+      const response = await patchJson("/api/settings", {
+        ollama_base_url: ollamaInput?.value?.trim() || "http://127.0.0.1:11434",
+        clear_aristotle_api_key: true,
+      });
+      workspaceSettings = response.settings ?? currentWorkspaceSettings();
+      settingsNotice = "Aristotle API key cleared.";
+      await bootstrap();
+    } catch (error) {
+      settingsError = error.message;
+      renderSettingsModal();
+    } finally {
+      settingsBusy = false;
+      renderSettingsModal();
+    }
+  });
+  settingsForm?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    settingsBusy = true;
+    settingsError = "";
+    settingsNotice = "";
+    renderSettingsModal();
+    try {
+      const payload = {
+        ollama_base_url: ollamaInput?.value?.trim() || "http://127.0.0.1:11434",
+      };
+      const nextKey = aristotleInput?.value?.trim() || "";
+      if (nextKey) {
+        payload.aristotle_api_key = nextKey;
+      }
+      const response = await patchJson("/api/settings", payload);
+      workspaceSettings = response.settings ?? currentWorkspaceSettings();
+      settingsNotice = "Settings saved.";
+      await bootstrap();
+    } catch (error) {
+      settingsError = error.message;
+      renderSettingsModal();
+    } finally {
+      settingsBusy = false;
+      renderSettingsModal();
+    }
+  });
+}
+
 function routeHref(projectId, routeKey, sessionId = null) {
   if (routeKey === "chats") {
     return sessionId
@@ -316,6 +595,17 @@ function deriveLauncherState(state) {
       parsed = {};
     }
   }
+  const fallbackEngine =
+    state.agent_engines?.find((engine) => engine.id === "none") ??
+    state.agent_engines?.[0] ?? {
+      id: "none",
+      label: "None",
+      available: true,
+      connect_target_label: "Provider",
+    };
+  const engineId =
+    state.agent_engines?.find((engine) => engine.id === parsed.engineId)?.id ??
+    fallbackEngine.id;
   const readyProviders = state.agent_providers.filter((provider) => provider.available);
   const fallbackProvider =
     readyProviders.find((provider) => provider.connected) ??
@@ -340,6 +630,7 @@ function deriveLauncherState(state) {
   const maxHours = clampInteger(parsed.maxHours, 4, 1, 24);
 
   return {
+    engineId,
     providerId,
     model,
     effort,
@@ -353,8 +644,13 @@ function saveLauncherState(projectId, payload) {
   window.localStorage.setItem(launcherStorageKey(projectId), JSON.stringify(payload));
 }
 
-function providerThreadForSession(session, providerId) {
-  return session?.provider_threads?.[providerId] ?? null;
+function providerThreadKey(engineId, providerId) {
+  return engineId && engineId !== "none" ? `${engineId}:${providerId}` : providerId;
+}
+
+function providerThreadForSession(session, providerId, engineId = "none") {
+  const providerThreads = session?.provider_threads ?? {};
+  return providerThreads[providerThreadKey(engineId, providerId)] ?? (engineId === "none" ? providerThreads[providerId] ?? null : null);
 }
 
 function formatSessionHandle(value) {
@@ -388,6 +684,16 @@ function folderLabelFromRoot(root) {
     .split("/")
     .filter(Boolean)
     .pop() ?? "";
+}
+
+function findEngine(state, engineId) {
+  return state.agent_engines?.find((engine) => engine.id === engineId) ?? null;
+}
+
+function agentIdentityLabel(record) {
+  const providerLabel = String(record?.provider_label ?? record?.backend ?? "Agent");
+  const engineLabel = String(record?.engine_label ?? "");
+  return engineLabel && engineLabel !== "None" ? `${engineLabel} + ${providerLabel}` : providerLabel;
 }
 
 function renderTopbar(projects, state, route, activeSession) {
@@ -690,7 +996,7 @@ function renderAgentCards(activeAgents) {
           (agent) => `
             <article class="agent-card">
               <div class="thread-card-head">
-                <p class="thread-title">${escapeHtml(agent.provider_label ?? agent.backend ?? "agent")}</p>
+                <p class="thread-title">${escapeHtml(agentIdentityLabel(agent))}</p>
                 <span class="thread-count">${escapeHtml(agent.status ?? "unknown")}</span>
               </div>
               <p class="thread-preview">${escapeHtml(agent.model ?? "")} • ${escapeHtml(agent.effort ?? "medium")}</p>
@@ -719,7 +1025,7 @@ function renderAgentStream(projectId, agentRuns, activeSession) {
         <article class="stream-card ${active}">
           <div class="stream-card-head">
             <div class="stream-card-title">
-              <p class="panel-label">${escapeHtml(run.provider_label ?? run.backend ?? "Agent")}</p>
+              <p class="panel-label">${escapeHtml(agentIdentityLabel(run))}</p>
               <h3>${escapeHtml(scopeLabel)}</h3>
             </div>
             <span class="status-chip">${status}</span>
@@ -1228,6 +1534,16 @@ function renderProviderOptions(providers, selectedProviderId) {
     .join("");
 }
 
+function renderEngineOptions(engines, selectedEngineId) {
+  return (engines ?? [])
+    .map((engine) => {
+      const selected = engine.id === selectedEngineId ? "selected" : "";
+      const suffix = engine.available ? "" : " (unavailable)";
+      return `<option value="${engine.id}" ${selected}>${escapeHtml(engine.label + suffix)}</option>`;
+    })
+    .join("");
+}
+
 function renderModelOptions(provider, selectedModel) {
   return (provider?.models ?? [])
     .map((model) => {
@@ -1250,6 +1566,9 @@ function renderMessageMeta(message) {
   const parts = [];
   const status = String(message.status ?? "");
   if (status && status !== "finished") {
+    if (message.engine_label && message.engine !== "none") {
+      parts.push(message.engine_label);
+    }
     if (message.provider_label) {
       parts.push(message.provider_label);
     }
@@ -1309,26 +1628,40 @@ function renderChatMessages(session) {
     .join("");
 }
 
-function renderProviderStatus(provider, session) {
-  if (!provider) {
+function renderLauncherStatus(engine, provider, session) {
+  if (!engine || !provider) {
     return "";
   }
-  const providerThread = providerThreadForSession(session, provider.id);
+  if (!engine.available) {
+    const detail = engine.notes?.[0] ?? `${engine.label} is unavailable on this machine.`;
+    const command = engine.command ? `<code>${escapeHtml(engine.command)}</code>` : "";
+    return `
+      <div class="provider-status warning">
+        <span class="provider-status-copy">${escapeHtml(detail)}</span>
+        ${command}
+      </div>
+    `;
+  }
+  const providerThread = providerThreadForSession(session, provider.id, engine.id);
   const activeConflict = Boolean(providerThread?.active_run_id);
   if (provider.status === "ready" && activeConflict) {
     return `
       <div class="provider-status ready">
-        <span class="provider-status-copy">Another ${escapeHtml(provider.label)} run is active. A new launch will start independently.</span>
+        <span class="provider-status-copy">Another ${escapeHtml(agentIdentityLabel({ engine_label: engine.label, provider_label: provider.label }))} run is active. A new launch will start independently.</span>
       </div>
     `;
   }
   if (provider.status === "ready") {
     return "";
   }
+  const providerWarning = provider.status === "disconnected"
+    ? provider.connect_hint ?? provider.status
+    : provider.status;
+  const connectCommand = (provider.connect_command ?? []).join(" ");
   return `
     <div class="provider-status warning">
-      <span class="provider-status-copy">${escapeHtml(provider.status)}</span>
-      <code>${escapeHtml((provider.connect_command ?? []).join(" "))}</code>
+      <span class="provider-status-copy">${escapeHtml(providerWarning)}</span>
+      ${connectCommand ? `<code>${escapeHtml(connectCommand)}</code>` : ""}
     </div>
   `;
 }
@@ -1345,7 +1678,9 @@ function renderChats(state, session) {
   }
 
   const launcher = deriveLauncherState(state);
+  const engine = findEngine(state, launcher.engineId) ?? state.agent_engines?.[0];
   const provider = state.agent_providers.find((item) => item.id === launcher.providerId);
+  const providerLabel = engine?.connect_target_label ?? "Provider";
   const runModeOnce = launcher.runMode === "once" ? "checked" : "";
   const runModeAuto = launcher.runMode === "autoresearch" ? "checked" : "";
   const automationOpen = launcher.runMode === "autoresearch" ? "active" : "";
@@ -1374,12 +1709,19 @@ function renderChats(state, session) {
             </div>
             <div class="launcher-grid compact composer-launcher-grid">
               <label class="select-control select-control-compact">
+                <span class="select-control-label">Engine</span>
+                <select id="engine-select" name="engine_id" aria-label="Engine">${renderEngineOptions(state.agent_engines, launcher.engineId)}</select>
+              </label>
+              <label class="select-control select-control-compact">
+                <span id="provider-select-label" class="select-control-label">${escapeHtml(providerLabel)}</span>
                 <select id="provider-select" name="provider_id" aria-label="Provider">${renderProviderOptions(state.agent_providers, launcher.providerId)}</select>
               </label>
               <label class="select-control select-control-compact">
+                <span class="select-control-label">Model</span>
                 <select id="model-select" name="model" aria-label="Model">${renderModelOptions(provider, launcher.model)}</select>
               </label>
               <label class="select-control select-control-compact">
+                <span class="select-control-label">Reasoning</span>
                 <select id="effort-select" name="effort" aria-label="Reasoning">${renderEffortOptions(provider, launcher.effort)}</select>
               </label>
             </div>
@@ -1397,9 +1739,9 @@ function renderChats(state, session) {
               </label>
               <p class="composer-automation-note">Stops only on the loop cap or the time budget.</p>
             </div>
-            <button class="action-button run-button" type="submit" ${provider?.status === "ready" ? "" : "disabled"}>${submitLabel}</button>
+            <button class="action-button run-button" type="submit" ${provider?.status === "ready" && engine?.available !== false ? "" : "disabled"}>${submitLabel}</button>
           </div>
-          <div id="provider-status-panel" class="composer-status-row">${renderProviderStatus(provider, session)}</div>
+          <div id="provider-status-panel" class="composer-status-row">${renderLauncherStatus(engine, provider, session)}</div>
         </form>
       </section>
       <aside class="panel agent-stream-panel">
@@ -1527,7 +1869,9 @@ function scrollChatToLatest() {
 }
 
 function applyProviderControls(state, session) {
+  const engineSelect = document.querySelector("#engine-select");
   const providerSelect = document.querySelector("#provider-select");
+  const providerSelectLabel = document.querySelector("#provider-select-label");
   const modelSelect = document.querySelector("#model-select");
   const effortSelect = document.querySelector("#effort-select");
   const providerStatusPanel = document.querySelector("#provider-status-panel");
@@ -1536,10 +1880,13 @@ function applyProviderControls(state, session) {
   const loopCountInput = document.querySelector("#loop-count-input");
   const loopHoursInput = document.querySelector("#loop-hours-input");
 
-  if (!providerSelect || !modelSelect || !effortSelect || !submitButton) {
+  if (!engineSelect || !providerSelect || !modelSelect || !effortSelect || !submitButton) {
     return;
   }
 
+  if (initial.engineId) {
+    engineSelect.value = initial.engineId;
+  }
   if (initial.providerId) {
     providerSelect.value = initial.providerId;
   }
@@ -1550,6 +1897,7 @@ function applyProviderControls(state, session) {
         ? "autoresearch"
         : "once";
     saveLauncherState(state.project.id, {
+      engineId: engineSelect.value,
       providerId: providerSelect.value,
       model: modelSelect.value,
       effort: effortSelect.value,
@@ -1560,9 +1908,13 @@ function applyProviderControls(state, session) {
   };
 
   const sync = ({ preserveSelections = true } = {}) => {
+    const engine = findEngine(state, engineSelect.value);
     const provider = state.agent_providers.find((item) => item.id === providerSelect.value);
-    if (!provider) {
+    if (!engine || !provider) {
       return;
+    }
+    if (providerSelectLabel) {
+      providerSelectLabel.textContent = engine.connect_target_label ?? "Provider";
     }
 
     const preferredModel = preserveSelections ? modelSelect.value || initial.model : "";
@@ -1580,12 +1932,13 @@ function applyProviderControls(state, session) {
     effortSelect.value = nextEffort;
 
     if (providerStatusPanel) {
-      providerStatusPanel.innerHTML = renderProviderStatus(provider, session);
+      providerStatusPanel.innerHTML = renderLauncherStatus(engine, provider, session);
     }
-    submitButton.disabled = provider.status !== "ready";
+    submitButton.disabled = provider.status !== "ready" || engine.available === false;
     persistState();
   };
 
+  engineSelect.addEventListener("change", () => sync({ preserveSelections: true }));
   providerSelect.addEventListener("change", () => sync({ preserveSelections: false }));
   modelSelect.addEventListener("change", persistState);
   effortSelect.addEventListener("change", persistState);
@@ -1616,6 +1969,7 @@ async function attachComposer(state, session) {
 
   form.addEventListener("submit", async (event) => {
     event.preventDefault();
+    const engineSelect = document.querySelector("#engine-select");
     const providerSelect = document.querySelector("#provider-select");
     const modelSelect = document.querySelector("#model-select");
     const effortSelect = document.querySelector("#effort-select");
@@ -1641,6 +1995,7 @@ async function attachComposer(state, session) {
     try {
       await postJson(`/api/projects/${state.project.id}/agents/runs`, {
         session_id: session.id,
+        engine_id: engineSelect.value,
         provider_id: providerSelect.value,
         model: modelSelect.value,
         effort: effortSelect.value,
@@ -1661,8 +2016,9 @@ async function attachComposer(state, session) {
         errorSlot.textContent = error.message;
       }
     } finally {
+      const engine = findEngine(state, engineSelect.value);
       const provider = state.agent_providers.find((item) => item.id === providerSelect.value);
-      submitButton.disabled = provider?.status !== "ready";
+      submitButton.disabled = provider?.status !== "ready" || engine?.available === false;
     }
   });
 
@@ -1691,6 +2047,7 @@ async function attachComposer(state, session) {
     }
     saveLauncherState(state.project.id, {
       ...deriveLauncherState(state),
+      engineId: document.querySelector("#engine-select")?.value ?? "none",
       providerId: document.querySelector("#provider-select")?.value ?? "",
       model: document.querySelector("#model-select")?.value ?? "",
       effort: document.querySelector("#effort-select")?.value ?? "medium",
@@ -1723,8 +2080,11 @@ function configurePolling(state, route) {
 async function bootstrap() {
   const route = routeFromPath();
   syncRouteChrome(route.routeKey);
+  const settingsPayload = await fetchJson("/api/settings");
+  workspaceSettings = settingsPayload.settings ?? defaultWorkspaceSettings();
   const projectsPayload = await fetchJson("/api/projects");
   const projects = projectsPayload.projects ?? [];
+  latestProjectState = null;
 
   renderProjectRail(projects, route.projectId);
 
@@ -1734,6 +2094,7 @@ async function bootstrap() {
     renderInspector(null, null);
     renderDock(null, projects);
     configurePolling(null, route);
+    renderSettingsModal();
     return;
   }
 
@@ -1744,10 +2105,12 @@ async function bootstrap() {
     renderInspector(null, null);
     renderDock(null, projects);
     configurePolling(null, route);
+    renderSettingsModal();
     return;
   }
 
   const state = await fetchJson(`/api/projects/${route.projectId}/state`);
+  latestProjectState = state;
   let activeSession = null;
   let effectiveRoute = { ...route };
   if (route.routeKey === "chats") {
@@ -1774,6 +2137,7 @@ async function bootstrap() {
     scrollChatToLatest();
   }
   configurePolling(state, effectiveRoute);
+  renderSettingsModal();
 }
 
 window.addEventListener("popstate", () => {
@@ -1781,6 +2145,11 @@ window.addEventListener("popstate", () => {
 });
 
 window.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && settingsOpen && !settingsBusy) {
+    event.preventDefault();
+    closeSettingsModal();
+    return;
+  }
   if (event.key === "Escape" && dialogState) {
     event.preventDefault();
     closeDialog(null);
@@ -1799,5 +2168,6 @@ function renderError(error) {
 }
 
 initializeThemeToggle();
+initializeSettingsButton();
 renderDialog();
 bootstrap().catch(renderError);
